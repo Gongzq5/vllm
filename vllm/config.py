@@ -1770,6 +1770,9 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 class ParallelConfig:
     """Configuration for the distributed execution."""
 
+    # attention_ffn_disaggration_enable: bool = False
+    # ffn_parallel_size: int = 0
+
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
@@ -4297,6 +4300,11 @@ class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
     """
+
+    disaggrated_ffn_enable: bool = False
+    """whether enable afd"""
+    disaggrated_ffn_size: int = 0
+    """ffn workers num"""
 
     # TODO: use default_factory once default constructing ModelConfig doesn't
     # try to download a model

@@ -25,7 +25,8 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 import typing
 from collections.abc import Callable, Iterable
-from typing import Any, Optional, Union
+from functools import wraps
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -632,6 +633,175 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+
+class DeepseekV2AttnLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str,
+        model_config: ModelConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        enable_eplb: bool = False,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
+        # DecoderLayers are created with `make_layers` which passes the prefix
+        # with the layer's index.
+        layer_idx = int(prefix.split(sep='.')[-1])
+        self.layer_idx = layer_idx
+        if model_config.use_mla:
+            attn_cls = DeepseekV2MLAAttention
+        else:
+            attn_cls = DeepseekV2Attention
+        self.self_attn = attn_cls(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=config.q_lora_rank
+            if hasattr(config, "q_lora_rank") else None,
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+
+        if hidden_states.dtype == torch.float16:
+            # Fix FP16 overflow
+            # We scale both hidden_states and residual before
+            # rmsnorm, and rmsnorm result would not affect by scale.
+            hidden_states *= 1. / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                # The residual is shared by all layers, we only scale it on
+                # first layer.
+                residual *= 1. / self.routed_scaling_factor
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        return hidden_states, residual
+
+from vllm.distributed.af_transfer.af_transfer_state import get_af_connector, has_af_connector
+
+def support_moe_afd(forward_func):
+
+    @wraps(forward_func)
+    def wrapper(self, **kwargs):
+
+        assert "hidden_states" in kwargs and "residual" in kwargs, "requires h and r for afd"
+
+        intermediate_tensors = af_connector.a2f_ffn()
+        result = forward_func(self, **kwargs)
+
+        IntermediateTensors({
+            "hidden_states": kwargs["hidden_states"],
+            "residual": kwargs["residual"],
+        })
+
+        return result
+
+    return wrapper
+
+
+class DeepseekV2MoELayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str,
+        model_config: ModelConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        enable_eplb: bool = False,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
+        # DecoderLayers are created with `make_layers` which passes the prefix
+        # with the layer's index.
+        layer_idx = int(prefix.split(sep='.')[-1])
+        self.layer_idx = layer_idx
+
+        if (config.n_routed_experts is not None
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0):
+            self.mlp = DeepseekV2MoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+                enable_eplb=enable_eplb,
+            )
+        else:
+            self.mlp = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+    @support_afd_a2f
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_states = self.mlp(hidden_states)
+
+        if isinstance(self.mlp,
+                      DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            # Fix FP16 overflow
+            # Scaling the DeepseekV2MLP output, it is the input of
+            # input_layernorm of next decoder layer.
+            # The scaling of DeepseekV2MOE output would be done in the forward
+            # of DeepseekV2MOE
+            hidden_states *= 1. / self.routed_scaling_factor
+
+        return hidden_states, residual
+
+
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
 
@@ -658,9 +828,21 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        self.start_layer, self.end_layer, self.a_layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(
+            lambda prefix: DeepseekV2AttnLayer(
+                config,
+                prefix,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                enable_eplb=enable_eplb,
+            ),
+            prefix=f"{prefix}.layers")
+
+        self.start_layer, self.end_layer, self.f_layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: DeepseekV2MoELayer(
                 config,
                 prefix,
                 model_config=model_config,
@@ -699,8 +881,17 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        for i in range(self.start_layer, self.end_layer):
+
+            hidden_states, residual = self.a_layers[i](positions, hidden_states, residual)
+
+            if self.afd_enable:
+                yield IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
+            else:
+                hidden_states, residual = self.f_layers[i](positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -710,6 +901,92 @@ class DeepseekV2Model(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+def maybe_attn_f2a():
+    if not has_af_connector():
+        return
+    af_connector = get_af_connector()
+
+
+# @support_torch_compile
+# class DeepseekV2Model(nn.Module):
+
+#     fall_back_to_pt_during_load = False
+
+#     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+#         super().__init__()
+
+#         config = vllm_config.model_config.hf_config
+#         model_config = vllm_config.model_config
+#         cache_config = vllm_config.cache_config
+#         quant_config = vllm_config.quant_config
+#         enable_eplb = vllm_config.parallel_config.enable_eplb
+#         self.config = config
+
+#         self.vocab_size = config.vocab_size
+
+#         if get_pp_group().is_first_rank:
+#             self.embed_tokens = VocabParallelEmbedding(
+#                 config.vocab_size,
+#                 config.hidden_size,
+#                 quant_config=quant_config,
+#                 prefix=f"{prefix}.embed_tokens")
+#         else:
+#             self.embed_tokens = PPMissingLayer()
+
+#         self.start_layer, self.end_layer, self.layers = make_layers(
+#             config.num_hidden_layers,
+#             lambda prefix: DeepseekV2DecoderLayer(
+#                 config,
+#                 prefix,
+#                 model_config=model_config,
+#                 cache_config=cache_config,
+#                 quant_config=quant_config,
+#                 enable_eplb=enable_eplb,
+#             ),
+#             prefix=f"{prefix}.layers")
+
+#         if get_pp_group().is_last_rank:
+#             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+#         else:
+#             self.norm = PPMissingLayer()
+#         self.make_empty_intermediate_tensors = (
+#             make_empty_intermediate_tensors_factory(
+#                 ["hidden_states", "residual"], config.hidden_size))
+
+#     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         return self.embed_tokens(input_ids)
+
+#     def forward(
+#         self,
+#         input_ids: torch.Tensor,
+#         positions: torch.Tensor,
+#         intermediate_tensors: Optional[IntermediateTensors],
+#         inputs_embeds: Optional[torch.Tensor] = None,
+#     ) -> Union[torch.Tensor, IntermediateTensors]:
+#         if get_pp_group().is_first_rank:
+#             if inputs_embeds is not None:
+#                 hidden_states = inputs_embeds
+#             else:
+#                 hidden_states = self.get_input_embeddings(input_ids)
+#             residual = None
+#         else:
+#             assert intermediate_tensors is not None
+#             hidden_states = intermediate_tensors["hidden_states"]
+#             residual = intermediate_tensors["residual"]
+
+#         for layer in self.layers[self.start_layer:self.end_layer]:
+#             hidden_states, residual = layer(positions, hidden_states, residual)
+
+#         if not get_pp_group().is_last_rank:
+#             return IntermediateTensors({
+#                 "hidden_states": hidden_states,
+#                 "residual": residual
+#             })
+
+#         hidden_states, _ = self.norm(hidden_states, residual)
+#         return hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):

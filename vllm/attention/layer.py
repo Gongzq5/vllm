@@ -395,6 +395,20 @@ def maybe_save_kv_layer_to_connector(
                             attn_metadata[layer_name])
 
 
+def wait_for_afd_intermediate_result_from_connector(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    assert isinstance(attn_metadata, dict)
+    connector.wait_for_layer_load(layer_name)
+
+
 def unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -402,7 +416,7 @@ def unified_attention(
     layer_name: str,
 ) -> torch.Tensor:
     wait_for_kv_layer_from_connector(layer_name)
-
+    wait_for_afd_intermediate_result_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
@@ -413,7 +427,27 @@ def unified_attention(
                                attn_metadata)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+    maybe_save_afd_intermediate_result_to_connector(layer_name, kv_cache)
     return output
+
+
+def maybe_save_afd_intermediate_result_to_connector(
+    layer_name: str,
+    kv_cache_layer: List[torch.Tensor],
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    assert isinstance(attn_metadata, dict)
+    connector.save_kv_layer(layer_name, kv_cache_layer,
+                            attn_metadata[layer_name])
+
 
 
 def unified_attention_fake(
