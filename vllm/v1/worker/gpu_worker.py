@@ -5,6 +5,8 @@ import gc
 import os
 from typing import TYPE_CHECKING, Optional
 
+from datetime import timedelta
+
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -13,7 +15,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
-                              init_distributed_environment,
+                              init_distributed_environment, init_afd_process_group,
                               set_custom_all_reduce)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
@@ -366,6 +368,22 @@ class Worker(WorkerBase):
     ) -> None:
         self.model_runner.save_tensorized_model(
             tensorizer_config=tensorizer_config, )
+
+class AFDWorker(Worker):
+    """A GPU worker class that uses AFD for model parallelism."""
+    def init_device(self):
+        super().init_device()
+        role = self.vllm_config.additional_config.get("role", None)
+
+        world_rank = 0 if role == "attn" else 1
+        init_afd_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            world_size=self.vllm_config.world_size,
+            rank=world_rank, # should derived from config
+            group_name="afd",
+            timeout=timedelta(minutes=2),
+        )
 
 
 def init_worker_distributed_environment(
