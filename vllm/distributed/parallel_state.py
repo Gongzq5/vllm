@@ -45,6 +45,25 @@ from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
 
+import torch.distributed as dist
+import torch
+
+from datetime import timedelta
+from typing import Any, Optional, Union
+
+
+import torch.distributed
+from torch.distributed.distributed_c10d import (
+    Backend,
+    PrefixStore,
+    Store,
+    _new_process_group_helper,
+    _world,
+    default_pg_timeout,
+    rendezvous,
+    _get_default_group,
+    _update_default_pg,
+)
 
 @dataclass
 class GraphCaptureContext:
@@ -862,11 +881,22 @@ def get_dp_group() -> GroupCoordinator:
 
 _EP: Optional[GroupCoordinator] = None
 
+_AE_GROUP: Optional[GroupCoordinator] = None
+
+_NEW_DEFAULT_GROUP: Optional[dist.ProcessGroup] = None
+
 
 def get_ep_group() -> GroupCoordinator:
     assert _EP is not None, ("expert parallel group is not initialized")
     return _EP
 
+def get_ae_group_new() -> GroupCoordinator:
+    assert _AE_GROUP is not None, ("afd group is not initialized")
+    return _AE_GROUP
+
+def get_new_default_group() -> dist.ProcessGroup:
+    assert _NEW_DEFAULT_GROUP is not None, ("_NEW_DEFAULT_GROUP  is not initialized")
+    return _NEW_DEFAULT_GROUP
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, (
@@ -947,11 +977,66 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available.")
             backend = "gloo"
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank)
+        enable_attn_export_split = config.additional_config.get(
+            "enable_attn_export_split", False)
+        if enable_attn_export_split:
+            default_group = torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank)
+            # add new_default_group
+            global _NEW_DEFAULT_GROUP
+            attn_ranks = list(config.additional_config.get("attn_ranks"))
+            ffn_ranks = list(config.additional_config.get("ffn_ranks"))
+            if _NEW_DEFAULT_GROUP is None:
+                _NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, len(attn_ranks) + len(ffn_ranks))
+            # switcher, update default group to new_default_group
+            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), _NEW_DEFAULT_GROUP)
+            # create sub_group in new_default_group
+            with default_pg_switcher:
+                sub_group_ranks = []
+                for i in range(len(ffn_ranks)):
+                    ranks = list([attn_ranks[i],ffn_ranks[i]])
+                    sub_group_ranks.append(ranks)
+
+                global _AE_GROUP
+                _AE_GROUP = init_model_parallel_group(sub_group_ranks,
+                                        rank,
+                                        backend,
+                                        group_name="ae")
+
+            # all-reduce in default_group   [[0, 1], [2, 3]]
+            data = torch.tensor([rank]).npu()
+            print(f'Default Group all-reduce Before: rank={rank}, data={data}') # [0, 1, 2, 3]
+            dist.all_reduce(data, group=default_group)
+            print(f'Default Group all-reduce After: rank={rank}, data={data}')  # [1, 1, 5, 5]
+            dist.barrier(group=_NEW_DEFAULT_GROUP)
+
+            # all-reduce in sub_group       [[0, 2], [1, 3]]
+            data = torch.tensor([rank]).npu()
+            with default_pg_switcher:
+                print(f'Sub Group all-reduce Before: rank={rank}, data={data}') # [0, 1]
+                dist.all_reduce(data, group=_AE_GROUP.device_group)
+                dist.barrier(group=_NEW_DEFAULT_GROUP)
+                print(f'Sub Group all-reduce After: rank={rank}, data={data}')  # [0, 2]
+
+            # send/recv in sub_group       [[0, 2], [1, 3]]
+            data = torch.tensor([100 + rank]).npu()
+            with default_pg_switcher:
+                print(f'Sub Group send/recv Before: rank={rank}, data={data}') # [0, 1, 2, 3]
+                # dist.send(tensor=data, dst=rank + 2,group=_AE_GROUP.device_group)
+                _AE_GROUP.send(data)
+                dist.barrier(group=_NEW_DEFAULT_GROUP)
+                print(f'Sub Group send/recv After: rank={rank}, data={data}')  # 
+        else:
+            default_group = torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank)
+        
+        
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -973,6 +1058,76 @@ def init_distributed_environment(
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size")
 
+class DefaultProcessGroupSwitcher:
+    def __init__(self, default_group, new_default_group):
+        self.default_group = default_group
+        self.new_default_group = new_default_group
+
+    def __enter__(self):
+        _update_default_pg(self.new_default_group)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        _update_default_pg(self.default_group)  
+
+def creat_hccl_process_group(rank, world_size):
+    import torch
+    torch.npu.set_device(rank)
+    new_default_group = init_process_group(
+        init_method='tcp://127.0.0.1:29500',
+        backend='gloo', 
+        rank=rank, 
+        world_size=world_size, 
+        group_name="new_hccl"
+    )
+    return new_default_group
+
+def init_process_group(
+    backend: Union[str, Backend] = None,
+    init_method: Optional[str] = None,
+    timeout: Optional[timedelta] = None,
+    world_size: int = -1,
+    rank: int = -1,
+    store: Optional[Store] = None,
+    group_name: str = None,
+    pg_options: Optional[Any] = None,
+):
+    assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
+
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
+
+    if backend:
+        backend = Backend(backend)
+    else:
+        backend = Backend("undefined")
+
+    if timeout is None:
+        timeout = default_pg_timeout
+
+    if store is None:
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+        store = PrefixStore(group_name, store)
+
+    pg_options_param_name = "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    pg, _ = _new_process_group_helper(
+        world_size,
+        rank,
+        [],
+        backend,
+        store,
+        group_name=group_name,
+        **{pg_options_param_name: pg_options},
+        timeout=timeout,
+    )
+
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+    return pg
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
