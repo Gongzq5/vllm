@@ -977,10 +977,10 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available.")
             backend = "gloo"
         # this backend is used for WORLD
-        enable_attn_export_split = config.additional_config.get(
+        enable_afd = config.additional_config.get(
             "enable_attn_export_split", False)
-        if enable_attn_export_split:
-            default_group = torch.distributed.init_process_group(
+        if enable_afd:
+            torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
@@ -999,38 +999,20 @@ def init_distributed_environment(
                 for i in range(len(ffn_ranks)):
                     ranks = list([attn_ranks[i],ffn_ranks[i]])
                     sub_group_ranks.append(ranks)
-
                 global _AE_GROUP
                 _AE_GROUP = init_model_parallel_group(sub_group_ranks,
                                         rank,
                                         backend,
                                         group_name="ae")
-
-            # all-reduce in default_group   [[0, 1], [2, 3]]
-            data = torch.tensor([rank]).npu()
-            print(f'Default Group all-reduce Before: rank={rank}, data={data}') # [0, 1, 2, 3]
-            dist.all_reduce(data, group=default_group)
-            print(f'Default Group all-reduce After: rank={rank}, data={data}')  # [1, 1, 5, 5]
-            dist.barrier(group=_NEW_DEFAULT_GROUP)
-
-            # all-reduce in sub_group       [[0, 2], [1, 3]]
+            # send/recv in sub_group       
             data = torch.tensor([rank]).npu()
             with default_pg_switcher:
-                print(f'Sub Group all-reduce Before: rank={rank}, data={data}') # [0, 1]
-                dist.all_reduce(data, group=_AE_GROUP.device_group)
-                dist.barrier(group=_NEW_DEFAULT_GROUP)
-                print(f'Sub Group all-reduce After: rank={rank}, data={data}')  # [0, 2]
-
-            # send/recv in sub_group       [[0, 2], [1, 3]]
-            data = torch.tensor([100 + rank]).npu()
-            with default_pg_switcher:
-                print(f'Sub Group send/recv Before: rank={rank}, data={data}') # [0, 1, 2, 3]
-                # dist.send(tensor=data, dst=rank + 2,group=_AE_GROUP.device_group)
+                print(f'Sub Group send/recv Before: rank={rank}, data={data}') 
                 _AE_GROUP.send(data)
                 dist.barrier(group=_NEW_DEFAULT_GROUP)
                 print(f'Sub Group send/recv After: rank={rank}, data={data}')  # 
         else:
-            default_group = torch.distributed.init_process_group(
+            torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
@@ -1069,19 +1051,17 @@ class DefaultProcessGroupSwitcher:
     def __exit__(self, exc_type, exc_value, traceback):
         _update_default_pg(self.default_group)  
 
-def creat_hccl_process_group(rank, world_size):
-    import torch
-    torch.npu.set_device(rank)
-    new_default_group = init_process_group(
-        init_method='tcp://127.0.0.1:29500',
-        backend='gloo', 
+def creat_hccl_process_group(rank, world_size,init_method,backend,group_name):
+    new_default_group = init_afd_process_group(
+        init_method=init_method,
+        backend=backend, 
         rank=rank, 
         world_size=world_size, 
-        group_name="new_hccl"
+        group_name=group_name
     )
     return new_default_group
 
-def init_process_group(
+def init_afd_process_group(
     backend: Union[str, Backend] = None,
     init_method: Optional[str] = None,
     timeout: Optional[timedelta] = None,
