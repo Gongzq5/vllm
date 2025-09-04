@@ -978,9 +978,9 @@ def init_distributed_environment(
             backend = "gloo"
         # this backend is used for WORLD
         enable_afd = config.additional_config.get(
-            "enable_attn_export_split", False)
+            "enable_afd", False)
         if enable_afd:
-            torch.distributed.init_process_group(
+            default_group =torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
@@ -1004,13 +1004,8 @@ def init_distributed_environment(
                                         rank,
                                         backend,
                                         group_name="ae")
-            # send/recv in sub_group       
-            data = torch.tensor([rank]).npu()
-            with default_pg_switcher:
-                print(f'Sub Group send/recv Before: rank={rank}, data={data}') 
-                _AE_GROUP.send(data)
-                dist.barrier(group=_NEW_DEFAULT_GROUP)
-                print(f'Sub Group send/recv After: rank={rank}, data={data}')  # 
+            print(f'rank={rank},create global process group success')      
+            print(f'rank={rank},start to run model') 
         else:
             torch.distributed.init_process_group(
                 backend=backend,
@@ -1051,17 +1046,21 @@ class DefaultProcessGroupSwitcher:
     def __exit__(self, exc_type, exc_value, traceback):
         _update_default_pg(self.default_group)  
 
-def creat_hccl_process_group(rank, world_size,init_method,backend,group_name):
-    new_default_group = init_afd_process_group(
-        init_method=init_method,
-        backend=backend, 
+def creat_hccl_process_group(rank, world_size):
+    import torch
+    import torch_npu
+    import os
+    torch.npu.set_device(rank)
+    new_default_group = init_process_group(
+        init_method='tcp://127.0.0.1:29500',
+        backend='gloo', 
         rank=rank, 
         world_size=world_size, 
-        group_name=group_name
+        group_name="new_hccl"
     )
     return new_default_group
 
-def init_afd_process_group(
+def init_process_group(
     backend: Union[str, Backend] = None,
     init_method: Optional[str] = None,
     timeout: Optional[timedelta] = None,
